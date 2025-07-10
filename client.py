@@ -18,6 +18,7 @@ class PhabricatorClient:
         self.base_url = base_url.rstrip("/")
         self.api_token = api_token
         self.session = requests.Session()
+        self.all_projects = {}
 
     def _make_request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -52,6 +53,16 @@ class PhabricatorClient:
             raise Exception(f"Request failed: {str(e)}")
 
     def paginated_request(self, method: str, params: dict):
+        """
+        Make a paginated request to the API
+
+        Args:
+            method: API method name
+            params: Request parameters
+
+        Yields:
+            Individual items from the paginated response
+        """
         cursor = None
         while True:
             if cursor:
@@ -85,7 +96,27 @@ class PhabricatorClient:
         response = self._make_request("project.search", params)
         return response.get("result", {}).get("data", [])
 
-    def get_project_phids(self, project_names: List[str]) -> List[str]:
+
+    def get_all_projects(self) -> dict:
+        """
+        Retrieves all projects from Phabricator.
+
+        Returns:
+            dict: A dictionary where each key is a project's PHID and the value is a dictionary of the project's fields.
+        """
+        params = {}
+        print("Getting all projects...")
+
+        response = self._make_request("project.search", params)
+        projects = response.get("result", {}).get("data", [])
+        result = {}
+        for project in projects:
+            fields = project.get("fields", {})
+            result[project.get("phid")] = fields
+
+        return result
+
+    def get_project_phids(self, project_names: List[str] = []) -> List[str]:
         """
         Get project PHIDs by their names
 
@@ -97,14 +128,13 @@ class PhabricatorClient:
         """
         phids = []
 
-        for project_name in project_names:
-            params = {"constraints[name]": project_name}
-            response = self._make_request("project.search", params)
+        if not project_names:
+            return list(self.all_projects.keys())
 
-            projects = response.get("result", {}).get("data", [])
-            for project in projects:
-                if project.get("fields", {}).get("name") == project_name:
-                    phids.append(project["phid"])
+        for project_name in project_names:
+            for phid, project in self.all_projects.items():
+                if project.get("name", "") == project_name:
+                    phids.append(phid)
                     break
 
         return phids
@@ -115,8 +145,9 @@ class PhabricatorClient:
         start_date: datetime,
         end_date: datetime,
         use_modified_date: bool = False,
-        statuses: List[str] | None = None,
+        statuses: List[str] = ["open", "resolved", "wontfix", "invalid", "duplicate"],
         limit: int = 100,
+        search_mode: str = "any",  # 'any' або 'all'
     ) -> List[Dict[str, Any]]:
         """
         Get tasks by projects for a specific period
@@ -125,20 +156,68 @@ class PhabricatorClient:
             project_phids: List of project PHIDs
             start_date: Start of the period
             end_date: End of the period
-            use_modified_date: Whether to use modified date instead of created date
+            use_modified_date: Whether to use modification date instead of creation date
             statuses: List of statuses (open, resolved, wontfix, invalid, duplicate)
             limit: Maximum number of results
+            search_mode: 'any' - tasks from any project, 'all' - tasks from all projects at once
 
         Returns:
             List of tasks
         """
-        params = {"order": "created", "limit": str(limit)}
+        all_tasks = []
+        if search_mode == "any":
+            any_tasks = {}
 
-        # Add projects
-        for i, phid in enumerate(project_phids):
-            params[f"constraints[projects][{i}]"] = phid
+            for project_phid in project_phids:
+                tasks = self._get_tasks_single_project(
+                    project_phid,
+                    start_date,
+                    end_date,
+                    use_modified_date,
+                    statuses,
+                    limit,
+                )
+                for task in tasks:
+                    task_id = task.get("id")
+                    task = any_tasks.get(task_id, task)
+                    current_project_name = self.all_projects.get(project_phid, {}).get("name", project_phid)
+                    project_names = task.get("projects", [])
+                    if current_project_name not in project_names:
+                        project_names.append(current_project_name)
+                        task["projects"] = project_names
+                    any_tasks[task_id] = task
 
-        # Add time period
+            all_tasks.extend(any_tasks.values())
+
+        else:
+            all_tasks = self._get_tasks_multiple_projects(
+                project_phids, start_date, end_date, use_modified_date, statuses, limit
+            )
+
+        all_tasks.sort(
+            key=lambda x: x.get("fields", {}).get("dateCreated", 0), reverse=True
+        )
+
+        return all_tasks
+
+    def _get_tasks_single_project(
+        self,
+        project_phid: str,
+        start_date: datetime,
+        end_date: datetime,
+        use_modified_date: bool = False,
+        statuses: List[str] = ["open", "resolved", "wontfix", "invalid", "duplicate"],
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get tasks for a single project
+        """
+        params = {
+            "order": "created",
+            "limit": str(limit),
+            "constraints[projects][0]": project_phid,
+        }
+
         start_timestamp = int(start_date.timestamp())
         end_timestamp = int(end_date.timestamp())
 
@@ -149,18 +228,54 @@ class PhabricatorClient:
             params["constraints[createdStart]"] = str(start_timestamp)
             params["constraints[createdEnd]"] = str(end_timestamp)
 
-        # Add statuses
+        if statuses:
+            for i, status in enumerate(statuses):
+                params[f"constraints[statuses][{i}]"] = status
+
+        tasks = []
+        for task in self.paginated_request("maniphest.search", params):
+            task["project_phid"] = project_phid
+            tasks.append(task)
+
+        return tasks
+
+    def _get_tasks_multiple_projects(
+        self,
+        project_phids: List[str],
+        start_date: datetime,
+        end_date: datetime,
+        use_modified_date: bool = False,
+        statuses: List[str] = ["open", "resolved", "wontfix", "invalid", "duplicate"],
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get tasks for multiple projects (AND logic)
+        """
+        params = {"order": "created", "limit": str(limit)}
+
+        for i, phid in enumerate(project_phids):
+            params[f"constraints[projects][{i}]"] = phid
+
+        start_timestamp = int(start_date.timestamp())
+        end_timestamp = int(end_date.timestamp())
+
+        if use_modified_date:
+            params["constraints[modifiedStart]"] = str(start_timestamp)
+            params["constraints[modifiedEnd]"] = str(end_timestamp)
+        else:
+            params["constraints[createdStart]"] = str(start_timestamp)
+            params["constraints[createdEnd]"] = str(end_timestamp)
+
         if statuses:
             for i, status in enumerate(statuses):
                 params[f"constraints[statuses][{i}]"] = status
 
         all_tasks = []
         for task in self.paginated_request("maniphest.search", params):
+            task["project_phids"] = project_phids
             all_tasks.append(task)
-            if len(all_tasks) >= limit:
-                break
 
-        return all_tasks[:limit]
+        return all_tasks
 
     def format_task_info(self, task: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -178,6 +293,7 @@ class PhabricatorClient:
             "id": task.get("id"),
             "phid": task.get("phid"),
             "title": fields.get("name", ""),
+            "projects": task.get("projects", []),
             "status": fields.get("status", {}).get("name", ""),
             "priority": fields.get("priority", {}).get("name", ""),
             "created": datetime.fromtimestamp(fields.get("dateCreated", 0)),
@@ -309,6 +425,7 @@ class PhabricatorClient:
 
 
 def main():
+
     parser = argparse.ArgumentParser(description="Phabricator tasks report")
     parser.add_argument("--csv", type=str, help="Export tasks to CSV file")
     parser.add_argument(
@@ -320,7 +437,6 @@ def main():
     parser.add_argument(
         "--projects",
         type=str,
-        required=True,
         help="Comma-separated list of project names",
     )
     parser.add_argument(
@@ -335,8 +451,12 @@ def main():
     TASK_STATUSES = [
         status.strip() for status in args.statuses.split(",") if status.strip()
     ]
+
     # Parse project names from argument
-    PROJECT_NAMES = [name.strip() for name in args.projects.split(",") if name.strip()]
+    if args.projects:
+        PROJECT_NAMES = [name.strip() for name in args.projects.split(",") if name.strip()]
+    else:
+        PROJECT_NAMES = []
 
     # Parse dates from arguments
     try:
@@ -354,28 +474,33 @@ def main():
         raise Exception("API_TOKEN environment variable is not set.")
     DEVTEAM_MEMBERS = os.environ.get("DEVTEAM_MEMBERS", "").split(",")
     DEVTEAM_MEMBERS = [name.strip() for name in DEVTEAM_MEMBERS if name.strip()]
-    DEVTEAM_MEMBERS_PHIDS = {}
-    DEVTEAM_MEMBERS_PHIDS_NAMES = {}
+
+    members_phids = {}
+    members_phids_names = {}
 
     # Create client
     client = PhabricatorClient(PHABRICATOR_URL, API_TOKEN)
+    client.all_projects = client.get_all_projects()
+    print(f"Found {len(client.all_projects)} projects in Phabricator.")
 
     try:
-        # Get all users
         all_users = client.get_all_users()
-
-        # Fill in PHIDs of team members
         print("Getting PHIDs of team members...")
-        DEVTEAM_MEMBERS_PHIDS = client.get_user_phids(DEVTEAM_MEMBERS)
+        members_phids = client.get_user_phids(DEVTEAM_MEMBERS)
 
         # Fill in dictionary with member names
-        for username, phid in DEVTEAM_MEMBERS_PHIDS.items():
-            DEVTEAM_MEMBERS_PHIDS_NAMES[phid] = username
+        for username, phid in members_phids.items():
+            members_phids_names[phid] = username
 
         # Get project PHIDs
-        print(f"Getting project PHIDs...{PROJECT_NAMES}")
         project_phids = client.get_project_phids(PROJECT_NAMES)
-        print(f"Found projects: {project_phids}")
+        print("\nSelected projects:")
+        if not project_phids:
+            print("  (No projects selected)")
+        else:
+            for phid in project_phids:
+                project_name = client.all_projects.get(phid, {}).get("name", phid)
+                print(f"  {project_name}: {phid}")
 
         print(
             f"\nSearching tasks for period: {start_date.strftime('%Y-%m-%d')} - {end_date.strftime('%Y-%m-%d')}"
@@ -388,7 +513,6 @@ def main():
             end_date=end_date,
             use_modified_date=True,  # Search by modification date (activation)
             statuses=TASK_STATUSES,
-            limit=50,
         )
 
         print(f"\nFound tasks: {len(tasks)}")
@@ -397,7 +521,10 @@ def main():
         tasks = [
             task
             for task in tasks
-            if task.get("fields", {}).get("ownerPHID") in DEVTEAM_MEMBERS_PHIDS.values()
+            if (
+            task.get("fields", {}).get("ownerPHID") in members_phids.values()
+            or task.get("fields", {}).get("authorPHID") in members_phids.values()
+            )
         ]
 
         print(f"Found tasks for the team: {len(tasks)}")
@@ -421,7 +548,7 @@ def main():
 
         # Print information about team members
         print("\nTeam members:")
-        for username, phid in DEVTEAM_MEMBERS_PHIDS.items():
+        for username, phid in members_phids.items():
             print(f"  {username}: {phid}")
 
         print("\nTeam tasks:")
@@ -432,6 +559,7 @@ def main():
             task_info = client.format_task_info(task)
             print(f"\nT{task_info['id']}: {task_info['title']}")
             print(f"  Status: {task_info['status']}")
+            print(f"  Projects: {', '.join(task_info['projects'])}")
             print(f"  Priority: {task_info['priority']}")
             print(f"  Created: {task_info['created']}")
             print(f"  Modified: {task_info['modified']}")
@@ -447,6 +575,7 @@ def main():
                 fieldnames = [
                     "id",
                     "title",
+                    "projects",
                     "status",
                     "priority",
                     "created",
@@ -464,6 +593,7 @@ def main():
                         {
                             "id": task_info["id"],
                             "title": task_info["title"],
+                            "projects": ", ".join(task_info["projects"]),
                             "status": task_info["status"],
                             "priority": task_info["priority"],
                             "created": task_info["created"],
