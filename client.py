@@ -51,6 +51,19 @@ class PhabricatorClient:
         except requests.exceptions.RequestException as e:
             raise Exception(f"Request failed: {str(e)}")
 
+    def paginated_request(self, method: str, params: dict):
+        cursor = None
+        while True:
+            if cursor:
+                params["after"] = cursor
+            response = self._make_request(method, params)
+            result = response.get("result", {})
+            yield from result.get("data", [])
+            cursor_info = result.get("cursor", {})
+            if not cursor_info.get("after"):
+                break
+            cursor = cursor_info["after"]
+
     def get_projects(
         self, project_names: List[str] | None = None
     ) -> List[Dict[str, Any]]:
@@ -142,26 +155,8 @@ class PhabricatorClient:
                 params[f"constraints[statuses][{i}]"] = status
 
         all_tasks = []
-        cursor = None
-
-        while True:
-            if cursor:
-                params["after"] = cursor
-
-            response = self._make_request("maniphest.search", params)
-            result = response.get("result", {})
-
-            tasks = result.get("data", [])
-            all_tasks.extend(tasks)
-
-            # Check if there are more pages
-            cursor_info = result.get("cursor", {})
-            if not cursor_info.get("after"):
-                break
-
-            cursor = cursor_info["after"]
-
-            # If limit reached, exit
+        for task in self.paginated_request("maniphest.search", params):
+            all_tasks.append(task)
             if len(all_tasks) >= limit:
                 break
 
@@ -257,101 +252,58 @@ class PhabricatorClient:
 
     def get_all_users(self) -> Dict[str, str]:
         """
-        Отримання всіх доступних користувачів
+        Get all available users
 
         Returns:
-            Словник {phid: username}
+            Dictionary {phid: username}
         """
         all_users_dict = {}
-        cursor = None
-
-        while True:
-            params = {"limit": "100", "order": "newest"}
-
-            if cursor:
-                params["after"] = cursor
-
-            try:
-                response = self._make_request("user.search", params)
-                result = response.get("result", {})
-
-                users = result.get("data", [])
-
-                for user in users:
-                    phid = user.get("phid")
-                    fields = user.get("fields", {})
-                    username = fields.get("username")
-
-                    if phid and username:
-                        all_users_dict[phid] = username
-
-                # Перевіряємо, чи є ще сторінки
-                cursor_info = result.get("cursor", {})
-                if not cursor_info.get("after"):
-                    break
-
-                cursor = cursor_info["after"]
-
-            except Exception as e:
-                print(f"Помилка при отриманні користувачів: {e}")
-                break
-
+        params = {"limit": "100", "order": "newest"}
+        try:
+            for user in self.paginated_request("user.search", params):
+                phid = user.get("phid")
+                fields = user.get("fields", {})
+                username = fields.get("username")
+                if phid and username:
+                    all_users_dict[phid] = username
+        except Exception as e:
+            print(f"Error while retrieving users: {e}")
         return all_users_dict
 
     def get_all_users_detailed(self) -> List[Dict[str, Any]]:
         """
-        Отримання детальної інформації про всіх доступних користувачів
+        Retrieve detailed information about all available users
 
         Returns:
-            Список словників з детальною інформацією про користувачів
+            List of dictionaries with detailed information about users
         """
         all_users = []
-        cursor = None
+        params = {"limit": "100", "order": "username"}
 
-        while True:
-            params = {"limit": "100", "order": "username"}
+        try:
+            for user in self.paginated_request("user.search", params):
+                phid = user.get("phid")
+                fields = user.get("fields", {})
 
-            if cursor:
-                params["after"] = cursor
+                user_info = {
+                    "phid": phid,
+                    "username": fields.get("username"),
+                    "realName": fields.get("realName"),
+                    "roles": fields.get("roles", []),
+                    "dateCreated": datetime.fromtimestamp(
+                        fields.get("dateCreated", 0)
+                    )
+                    if fields.get("dateCreated")
+                    else None,
+                    "isDisabled": fields.get("isDisabled", False),
+                    "isBot": fields.get("isBot", False),
+                    "isMailingList": fields.get("isMailingList", False),
+                    "isSystemAgent": fields.get("isSystemAgent", False),
+                }
 
-            try:
-                response = self._make_request("user.search", params)
-                result = response.get("result", {})
-
-                users = result.get("data", [])
-
-                for user in users:
-                    phid = user.get("phid")
-                    fields = user.get("fields", {})
-
-                    user_info = {
-                        "phid": phid,
-                        "username": fields.get("username"),
-                        "realName": fields.get("realName"),
-                        "roles": fields.get("roles", []),
-                        "dateCreated": datetime.fromtimestamp(
-                            fields.get("dateCreated", 0)
-                        )
-                        if fields.get("dateCreated")
-                        else None,
-                        "isDisabled": fields.get("isDisabled", False),
-                        "isBot": fields.get("isBot", False),
-                        "isMailingList": fields.get("isMailingList", False),
-                        "isSystemAgent": fields.get("isSystemAgent", False),
-                    }
-
-                    all_users.append(user_info)
-
-                # Перевіряємо, чи є ще сторінки
-                cursor_info = result.get("cursor", {})
-                if not cursor_info.get("after"):
-                    break
-
-                cursor = cursor_info["after"]
-
-            except Exception as e:
-                print(f"Помилка при отриманні користувачів: {e}")
-                break
+                all_users.append(user_info)
+        except Exception as e:
+            print(f"Error while retrieving users: {e}")
 
         return all_users
 
