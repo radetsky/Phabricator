@@ -1,9 +1,8 @@
 from datetime import datetime
-import os
 import argparse
 import csv
 
-from phabricator.client import PhabricatorClient
+from phabricator.client import PhabricatorClient, PhabricatorConfiguration
 
 def main():
 
@@ -46,28 +45,25 @@ def main():
     except ValueError:
         raise Exception("Invalid date format. Please use YYYY-MM-DD.")
 
-    # Configuration
-    PHABRICATOR_URL = os.environ.get("PHABRICATOR_URL")
-    if not PHABRICATOR_URL:
-        raise Exception("PHABRICATOR_URL environment variable is not set.")
-    API_TOKEN = os.environ.get("API_TOKEN")
-    if not API_TOKEN:
-        raise Exception("API_TOKEN environment variable is not set.")
-    DEVTEAM_MEMBERS = os.environ.get("DEVTEAM_MEMBERS", "").split(",")
-    DEVTEAM_MEMBERS = [name.strip() for name in DEVTEAM_MEMBERS if name.strip()]
+    # Validate date range
+    if start_date > end_date:
+        raise Exception("Start date cannot be later than end date.")
+
+    phconf = PhabricatorConfiguration()
+    phconf.read_from_env()
 
     members_phids = {}
     members_phids_names = {}
 
     # Create client
-    client = PhabricatorClient(PHABRICATOR_URL, API_TOKEN)
+    client = PhabricatorClient(phconf)
     client.all_projects = client.get_all_projects()
     print(f"Found {len(client.all_projects)} projects in Phabricator.")
 
     try:
         all_users = client.get_all_users()
         print("Getting PHIDs of team members...")
-        members_phids = client.get_user_phids(DEVTEAM_MEMBERS)
+        members_phids = client.get_user_phids(phconf.devteam_members)
 
         # Fill in dictionary with member names
         for username, phid in members_phids.items():

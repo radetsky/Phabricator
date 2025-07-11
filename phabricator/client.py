@@ -1,19 +1,48 @@
+import os
 import requests
+
 from datetime import datetime
 from typing import List, Dict, Any
 
+class PhabricatorConfigurationError(Exception):
+    """
+    Custom exception for Phabricator API errors
+    """
+
+
+class PhabricatorConfiguration:
+    """
+    Configuration for Phabricator API client
+    """
+    def __init__(self):
+        self.base_url = ""
+        self.api_token = ""
+        self.devteam_members = []
+
+    def read_from_env(self):
+        """
+        Read configuration from environment variables
+        """
+        self.base_url = os.environ.get("PHABRICATOR_URL", "").rstrip("/")
+        if not self.base_url:
+            raise PhabricatorConfigurationError("PHABRICATOR_URL environment variable is not set.")
+        self.api_token = os.environ.get("API_TOKEN", "")
+        if not self.api_token:
+            raise PhabricatorConfigurationError("API_TOKEN environment variable is not set.")
+        self.devteam_members = os.environ.get("DEVTEAM_MEMBERS", "").split(",")
+        self.devteam_members = [name.strip() for name in self.devteam_members if name.strip()]
 
 class PhabricatorClient:
-    def __init__(self, base_url: str, api_token: str):
+    def __init__(self, config: PhabricatorConfiguration):
         """
         Initialize Phabricator API client
 
         Args:
-            base_url: URL of the Phabricator instance (e.g., 'https://phabricator.example.com')
-            api_token: API token for authentication
+            config: PhabricatorConfiguration object
         """
-        self.base_url = base_url.rstrip("/")
-        self.api_token = api_token
+        self.base_url = config.base_url
+        self.api_token = config.api_token
+        self.devteam_members = config.devteam_members
         self.session = requests.Session()
         self.all_projects = {}
 
