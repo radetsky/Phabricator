@@ -1,8 +1,10 @@
 import os
+from pprint import pprint
 import requests
 
-from datetime import datetime
-from typing import List, Dict, Any
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
+
 
 class PhabricatorConfigurationError(Exception):
     """
@@ -14,6 +16,7 @@ class PhabricatorConfiguration:
     """
     Configuration for Phabricator API client
     """
+
     def __init__(self):
         self.base_url = ""
         self.api_token = ""
@@ -25,12 +28,19 @@ class PhabricatorConfiguration:
         """
         self.base_url = os.environ.get("PHABRICATOR_URL", "").rstrip("/")
         if not self.base_url:
-            raise PhabricatorConfigurationError("PHABRICATOR_URL environment variable is not set.")
+            raise PhabricatorConfigurationError(
+                "PHABRICATOR_URL environment variable is not set."
+            )
         self.api_token = os.environ.get("API_TOKEN", "")
         if not self.api_token:
-            raise PhabricatorConfigurationError("API_TOKEN environment variable is not set.")
+            raise PhabricatorConfigurationError(
+                "API_TOKEN environment variable is not set."
+            )
         self.devteam_members = os.environ.get("DEVTEAM_MEMBERS", "").split(",")
-        self.devteam_members = [name.strip() for name in self.devteam_members if name.strip()]
+        self.devteam_members = [
+            name.strip() for name in self.devteam_members if name.strip()
+        ]
+
 
 class PhabricatorClient:
     def __init__(self, config: PhabricatorConfiguration):
@@ -45,6 +55,8 @@ class PhabricatorClient:
         self.devteam_members = config.devteam_members
         self.session = requests.Session()
         self.all_projects = {}
+        self.members_phids = {}
+        self.members_phids_names = {}
 
     def _make_request(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -447,3 +459,186 @@ class PhabricatorClient:
             print(f"Error while retrieving users: {e}")
 
         return all_users
+
+    def get_task_details(self, task_id: str | int) -> Dict:
+        """
+        Retrieve task details including dates
+        """
+        if isinstance(task_id, str) and task_id.startswith("T"):
+            task_id = int(task_id.replace("T", ""))
+        params = {
+            "constraints[ids][0]": task_id,
+        }
+        response = self._make_request("maniphest.search", params)
+        data = response.get("result", {}).get("data", [])
+        if data:
+            return data[0]
+        return {}
+
+    def get_task_transactions(self, task_phid: str) -> List[Dict]:
+        """
+        Retrieve the task's change history to accurately determine the closing date
+        """
+        params = {"objectIdentifier": task_phid}
+        response = self._make_request("transaction.search", params)
+        return response.get("result", {}).get("data", [])
+
+    def calculate_task_duration(self, task_id: str) -> Dict:
+        """
+        Calculate the duration of a task
+        """
+        task = self.get_task_details(task_id)
+
+        if not task:
+            return {"error": f"Task {task_id} not found"}
+
+        created_timestamp = task["fields"]["dateCreated"]
+        created_date = datetime.fromtimestamp(created_timestamp)
+
+        # Modified date (last change)
+        modified_timestamp = task["fields"]["dateModified"]
+        modified_date = datetime.fromtimestamp(modified_timestamp)
+
+        # Check status
+        status = task["fields"]["status"]["name"]
+        is_resolved = task["fields"]["status"]["value"] == "resolved"
+
+        result = {
+            "task_id": task_id,
+            "title": task["fields"]["name"],
+            "status": status,
+            "created_date": created_date.strftime("%Y-%m-%d %H:%M:%S"),
+            "modified_date": modified_date.strftime("%Y-%m-%d %H:%M:%S"),
+            "is_resolved": is_resolved,
+        }
+
+        if is_resolved:
+            # Find the exact closure date in transactions
+            transactions = self.get_task_transactions(task["phid"])
+            closed_date = self._find_closure_date(transactions)
+
+            if closed_date:
+                result["closed_date"] = closed_date.strftime("%Y-%m-%d %H:%M:%S")
+                duration = closed_date - created_date
+            else:
+                # If the exact closure date was not found, use the modified date
+                result["closed_date"] = modified_date.strftime("%Y-%m-%d %H:%M:%S")
+                duration = modified_date - created_date
+
+            result["duration_days"] = duration.days
+            result["duration_hours"] = round(duration.total_seconds() / 3600, 2)
+            result["duration_formatted"] = self._format_duration(duration)
+        else:
+            # Task is not closed yet - calculate time from creation to now
+            now = datetime.now()
+            duration = now - created_date
+            result["duration_days"] = duration.days
+            result["duration_hours"] = round(duration.total_seconds() / 3600, 2)
+            result["duration_formatted"] = self._format_duration(duration)
+            result["note"] = (
+                "Task is not closed yet. Showing time from creation to now."
+            )
+
+        return result
+
+    def _find_closure_date(self, transactions: List[Dict]) -> Optional[datetime]:
+        """
+        Find the closure date of a task in its transactions
+        """
+        for transaction in transactions:
+            if transaction["type"] == "status":
+                # Find the transaction that changed the status to closed
+                for state, value in transaction["fields"].items():
+                    if (
+                        state == "new"
+                        and value == "resolved"
+                    ):
+                        return datetime.fromtimestamp(transaction["dateCreated"])
+        return None
+
+    def _format_duration(self, duration: timedelta) -> str:
+
+        """
+        Format duration into a human-readable string
+        """
+        days = duration.days
+        hours = duration.seconds // 3600
+        minutes = (duration.seconds % 3600) // 60
+
+        parts = []
+        if days > 0:
+            parts.append(f"{days} days")
+        if hours > 0:
+            parts.append(f"{hours} hours")
+        if minutes > 0:
+            parts.append(f"{minutes} minutes")
+
+        return " ".join(parts) if parts else "less than a minute"
+
+    def get_tasks_by_date_range(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        status: str = "resolved",
+    ) -> List[Dict[str, Any]]:
+        """
+        Get tasks by date range and status
+
+        Args:
+            start_date: Start date of the range
+            end_date: End date of the range
+            status: Task status to filter by
+
+        Returns:
+            List of tasks within the specified date range and status
+        """
+        params = {
+            "constraints[closedStart]": str(int(start_date.timestamp())),
+            "constraints[closedEnd]": str(int(end_date.timestamp())),
+            "constraints[statuses][0]": status,
+        }
+        return list(self.paginated_request("maniphest.search", params))
+
+    def get_members_phids(self):
+        self.members_phids = self.get_user_phids(self.devteam_members)
+        for username, phid in self.members_phids.items():
+            self.members_phids_names[phid] = username
+
+    def filter_tasks_by_members(
+        self,
+        tasks: List[Dict[str, Any]],
+        field: str = "both",  # "both", "owner", or "author"
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter tasks by team members' PHIDs
+
+        Args:
+            tasks: List of tasks to filter
+            field: Which field to filter by ("both", "owner", or "author")
+
+        Returns:
+            Filtered list of tasks assigned to team members
+        """
+        member_phids = set(self.members_phids.values())
+
+        if field == "owner":
+            return [
+                task
+                for task in tasks
+                if task.get("fields", {}).get("ownerPHID") in member_phids
+            ]
+        elif field == "author":
+            return [
+                task
+                for task in tasks
+                if task.get("fields", {}).get("authorPHID") in member_phids
+            ]
+        else:  # both
+            return [
+                task
+                for task in tasks
+                if (
+                    task.get("fields", {}).get("ownerPHID") in member_phids
+                    or task.get("fields", {}).get("authorPHID") in member_phids
+                )
+            ]
