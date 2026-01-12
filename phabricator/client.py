@@ -433,7 +433,7 @@ class PhabricatorClient:
             List of dictionaries with detailed information about users
         """
         all_users = []
-        params = {"limit": "100", "order": "username"}
+        params = {"limit": "100", "order": "newest"}
 
         try:
             for user in self.paginated_request("user.search", params):
