@@ -115,8 +115,11 @@ python cli.py lifecycle --start-date 2024-01-01 --end-date 2024-12-31 --csv life
 ### `stats` — Team and project statistics
 
 ```bash
-# All statistics (team + projects + duration)
+# All statistics
 python cli.py stats --start-date 2024-01-01 --end-date 2024-12-31
+
+# Filter by specific project
+python cli.py stats --start-date 2024-01-01 --end-date 2024-12-31 --projects "ProjectA"
 
 # Team member statistics only
 python cli.py stats --start-date 2024-01-01 --end-date 2024-12-31 --type team
@@ -127,8 +130,8 @@ python cli.py stats --start-date 2024-01-01 --end-date 2024-12-31 --type project
 # Average duration by team member
 python cli.py stats --start-date 2024-01-01 --end-date 2024-12-31 --type duration
 
-# Project stats filtered by team members only
-python cli.py stats --start-date 2024-01-01 --end-date 2024-12-31 --type projects --team
+# Utilization rate (workload distribution)
+python cli.py stats --start-date 2024-01-01 --end-date 2024-12-31 --type utilization
 ```
 
 **Statistics types:**
@@ -138,7 +141,8 @@ python cli.py stats --start-date 2024-01-01 --end-date 2024-12-31 --type project
 | `team` | Tasks resolved, open, authored, and owned per team member |
 | `projects` | Average task duration by project (days, min/max hours) |
 | `duration` | Average task duration by team member |
-| `all` | All three reports (default) |
+| `utilization` | Workload distribution: task count % and hours % per member |
+| `all` | All reports (default) |
 
 ### `status` — Show sync status
 
@@ -167,20 +171,29 @@ charlie         15         23       121        24
 TOTAL           123        91       238        140
 ```
 
-### Average Duration by Project
+### Utilization Rate (Workload Distribution)
 
 ```
 ======================================================================
-AVERAGE TASK DURATION BY PROJECT
+UTILIZATION RATE (WORKLOAD DISTRIBUTION)
 Period: 2024-01-01 - 2024-12-31
+Projects: rdas-app
 ======================================================================
 
-Project                        Tasks    Avg Days   Min Hrs    Max Hrs
-----------------------------------------------------------------------
-backend                        190      20.6       0.2        500.3
-frontend                       150      41.8       0.0        320.5
-infrastructure                 137      34.6       0.2        890.8
+Member          Tasks    Hours        Task %     Hours %
+------------------------------------------------------------
+alice           40       5964.0       27.0%      35.2%
+bob             35       2583.0       23.6%      15.3%
+charlie         28       2142.0       18.9%      12.7%
+------------------------------------------------------------
+TOTAL           103      10689.0      100%       100%
 ```
+
+Shows workload distribution across team members:
+- **Task %** — percentage of resolved tasks
+- **Hours %** — percentage of total calendar hours (time from task creation to resolution)
+
+Helps identify workload imbalances in the team.
 
 ## Architecture
 

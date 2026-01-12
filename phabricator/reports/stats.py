@@ -12,11 +12,31 @@ class StatsReporter:
     def __init__(self, session: Session):
         self.session = session
 
+    def _get_project_phids(self, project_names: list[str]) -> set[str]:
+        """Get project PHIDs by names."""
+        return set(
+            self.session.execute(
+                select(Project.phid).where(Project.name.in_(project_names))
+            )
+            .scalars()
+            .all()
+        )
+
+    def _filter_by_projects(self, stmt, project_phids: set[str]):
+        """Add project filter to a query using subquery."""
+        task_ids_in_projects = (
+            select(task_projects.c.task_id)
+            .where(task_projects.c.project_phid.in_(project_phids))
+            .distinct()
+        )
+        return stmt.where(Task.id.in_(task_ids_in_projects))
+
     def get_team_member_stats(
         self,
         start_date: datetime,
         end_date: datetime,
         member_usernames: list[str],
+        project_names: Optional[list[str]] = None,
     ) -> list[dict]:
         """Statistics per team member: tasks created, owned, resolved."""
         member_phids = dict(
@@ -27,71 +47,74 @@ class StatsReporter:
             ).all()
         )
 
+        project_phids = None
+        if project_names:
+            project_phids = self._get_project_phids(project_names)
+
         stats = []
         for username, phid in member_phids.items():
+            # Base filter for project membership
+            def apply_project_filter(stmt):
+                if project_phids:
+                    return self._filter_by_projects(stmt, project_phids)
+                return stmt
+
             # Tasks owned (assigned to member)
-            owned_total = self.session.scalar(
-                select(func.count(Task.id)).where(Task.owner_phid == phid)
-            )
+            stmt = select(func.count(Task.id)).where(Task.owner_phid == phid)
+            owned_total = self.session.scalar(apply_project_filter(stmt))
 
             # Tasks owned in period (by modified date)
-            owned_in_period = self.session.scalar(
-                select(func.count(Task.id)).where(
-                    and_(
-                        Task.owner_phid == phid,
-                        Task.date_modified >= start_date,
-                        Task.date_modified <= end_date,
-                    )
+            stmt = select(func.count(Task.id)).where(
+                and_(
+                    Task.owner_phid == phid,
+                    Task.date_modified >= start_date,
+                    Task.date_modified <= end_date,
                 )
             )
+            owned_in_period = self.session.scalar(apply_project_filter(stmt))
 
             # Tasks authored (created by member)
-            authored_total = self.session.scalar(
-                select(func.count(Task.id)).where(Task.author_phid == phid)
-            )
+            stmt = select(func.count(Task.id)).where(Task.author_phid == phid)
+            authored_total = self.session.scalar(apply_project_filter(stmt))
 
             # Tasks authored in period
-            authored_in_period = self.session.scalar(
-                select(func.count(Task.id)).where(
-                    and_(
-                        Task.author_phid == phid,
-                        Task.date_created >= start_date,
-                        Task.date_created <= end_date,
-                    )
+            stmt = select(func.count(Task.id)).where(
+                and_(
+                    Task.author_phid == phid,
+                    Task.date_created >= start_date,
+                    Task.date_created <= end_date,
                 )
             )
+            authored_in_period = self.session.scalar(apply_project_filter(stmt))
 
             # Resolved tasks (owned by member)
-            resolved_total = self.session.scalar(
-                select(func.count(Task.id)).where(
-                    and_(
-                        Task.owner_phid == phid,
-                        Task.status_value == "resolved",
-                    )
+            stmt = select(func.count(Task.id)).where(
+                and_(
+                    Task.owner_phid == phid,
+                    Task.status_value == "resolved",
                 )
             )
+            resolved_total = self.session.scalar(apply_project_filter(stmt))
 
             # Resolved in period
-            resolved_in_period = self.session.scalar(
-                select(func.count(Task.id)).where(
-                    and_(
-                        Task.owner_phid == phid,
-                        Task.status_value == "resolved",
-                        Task.date_closed >= start_date,
-                        Task.date_closed <= end_date,
-                    )
+            stmt = select(func.count(Task.id)).where(
+                and_(
+                    Task.owner_phid == phid,
+                    Task.status_value == "resolved",
+                    Task.date_closed >= start_date,
+                    Task.date_closed <= end_date,
                 )
             )
+            resolved_in_period = self.session.scalar(apply_project_filter(stmt))
 
             # Open tasks owned
-            open_tasks = self.session.scalar(
-                select(func.count(Task.id)).where(
-                    and_(
-                        Task.owner_phid == phid,
-                        Task.status_value == "open",
-                    )
+            stmt = select(func.count(Task.id)).where(
+                and_(
+                    Task.owner_phid == phid,
+                    Task.status_value == "open",
                 )
             )
+            open_tasks = self.session.scalar(apply_project_filter(stmt))
 
             stats.append(
                 {
@@ -177,6 +200,7 @@ class StatsReporter:
         start_date: datetime,
         end_date: datetime,
         member_usernames: list[str],
+        project_names: Optional[list[str]] = None,
     ) -> list[dict]:
         """Average task duration by team member for resolved tasks."""
         member_phids = dict(
@@ -186,6 +210,10 @@ class StatsReporter:
                 )
             ).all()
         )
+
+        project_phids = None
+        if project_names:
+            project_phids = self._get_project_phids(project_names)
 
         stats = []
         for username, phid in member_phids.items():
@@ -198,6 +226,9 @@ class StatsReporter:
                     Task.date_closed.isnot(None),
                 )
             )
+
+            if project_phids:
+                stmt = self._filter_by_projects(stmt, project_phids)
 
             tasks = self.session.execute(stmt).scalars().all()
 
@@ -247,10 +278,124 @@ class StatsReporter:
         stats.sort(key=lambda x: x["tasks_count"], reverse=True)
         return stats
 
-    def print_team_stats(self, stats: list[dict], start_date: datetime, end_date: datetime):
+    def get_utilization_rate(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        member_usernames: list[str],
+        project_names: Optional[list[str]] = None,
+    ) -> list[dict]:
+        """
+        Calculate utilization rate (workload distribution) per team member.
+        Shows both task count % and hours %.
+        """
+        member_phids = dict(
+            self.session.execute(
+                select(User.username, User.phid).where(
+                    User.username.in_(member_usernames)
+                )
+            ).all()
+        )
+
+        project_phids = None
+        if project_names:
+            project_phids = self._get_project_phids(project_names)
+
+        member_stats = []
+        for username, phid in member_phids.items():
+            stmt = select(Task).where(
+                and_(
+                    Task.owner_phid == phid,
+                    Task.status_value == "resolved",
+                    Task.date_closed >= start_date,
+                    Task.date_closed <= end_date,
+                    Task.date_closed.isnot(None),
+                )
+            )
+
+            if project_phids:
+                stmt = self._filter_by_projects(stmt, project_phids)
+
+            tasks = self.session.execute(stmt).scalars().all()
+
+            total_hours = 0.0
+            for task in tasks:
+                if task.date_closed and task.date_created:
+                    duration = task.date_closed - task.date_created
+                    total_hours += duration.total_seconds() / 3600
+
+            member_stats.append({
+                "username": username,
+                "tasks_count": len(tasks),
+                "total_hours": round(total_hours, 1),
+            })
+
+        # Calculate totals
+        total_tasks = sum(s["tasks_count"] for s in member_stats)
+        total_hours = sum(s["total_hours"] for s in member_stats)
+
+        # Calculate percentages
+        for s in member_stats:
+            s["task_percent"] = round(
+                (s["tasks_count"] / total_tasks * 100) if total_tasks > 0 else 0, 1
+            )
+            s["hours_percent"] = round(
+                (s["total_hours"] / total_hours * 100) if total_hours > 0 else 0, 1
+            )
+
+        member_stats.sort(key=lambda x: x["tasks_count"], reverse=True)
+        return member_stats
+
+    def print_utilization_rate(
+        self,
+        stats: list[dict],
+        start_date: datetime,
+        end_date: datetime,
+        project_names: Optional[list[str]] = None,
+    ):
+        print(f"\n{'='*70}")
+        print(f"UTILIZATION RATE (WORKLOAD DISTRIBUTION)")
+        print(f"Period: {start_date.strftime('%Y-%m-%d')} - {end_date.strftime('%Y-%m-%d')}")
+        if project_names:
+            print(f"Projects: {', '.join(project_names)}")
+        print(f"{'='*70}\n")
+
+        header = f"{'Member':<15} {'Tasks':<8} {'Hours':<12} {'Task %':<10} {'Hours %':<10}"
+        print(header)
+        print("-" * 60)
+
+        for s in stats:
+            print(
+                f"{s['username']:<15} "
+                f"{s['tasks_count']:<8} "
+                f"{s['total_hours']:<12} "
+                f"{s['task_percent']:<10} "
+                f"{s['hours_percent']:<10}"
+            )
+
+        print("-" * 60)
+        total_tasks = sum(s["tasks_count"] for s in stats)
+        total_hours = sum(s["total_hours"] for s in stats)
+        print(
+            f"{'TOTAL':<15} "
+            f"{total_tasks:<8} "
+            f"{round(total_hours, 1):<12} "
+            f"{'100%':<10} "
+            f"{'100%':<10}"
+        )
+
+    def print_team_stats(
+        self,
+        stats: list[dict],
+        start_date: datetime,
+        end_date: datetime,
+        project_names: Optional[list[str]] = None,
+    ):
         print(f"\n{'='*70}")
         print(f"TEAM MEMBER STATISTICS")
         print(f"Period: {start_date.strftime('%Y-%m-%d')} - {end_date.strftime('%Y-%m-%d')}")
+        if project_names:
+            print(f"Projects: {', '.join(project_names)}")
         print(f"{'='*70}\n")
 
         header = f"{'Member':<15} {'Resolved':<10} {'Open':<8} {'Authored':<10} {'Owned':<8}"
@@ -300,10 +445,18 @@ class StatsReporter:
                 f"{s['max_duration_hours']:<10}"
             )
 
-    def print_duration_by_member(self, stats: list[dict], start_date: datetime, end_date: datetime):
+    def print_duration_by_member(
+        self,
+        stats: list[dict],
+        start_date: datetime,
+        end_date: datetime,
+        project_names: Optional[list[str]] = None,
+    ):
         print(f"\n{'='*70}")
         print(f"AVERAGE TASK DURATION BY TEAM MEMBER")
         print(f"Period: {start_date.strftime('%Y-%m-%d')} - {end_date.strftime('%Y-%m-%d')}")
+        if project_names:
+            print(f"Projects: {', '.join(project_names)}")
         print(f"{'='*70}\n")
 
         header = f"{'Member':<15} {'Tasks':<8} {'Avg Days':<10} {'Min Hrs':<10} {'Max Hrs':<10}"

@@ -146,15 +146,20 @@ def handle_stats(args):
             print("Error: Start date cannot be later than end date.")
             sys.exit(1)
 
+        project_names = None
+        if args.projects:
+            project_names = [p.strip() for p in args.projects.split(",") if p.strip()]
+
         reporter = StatsReporter(session)
 
         if args.type == "team" or args.type == "all":
             stats = reporter.get_team_member_stats(
-                start_date, end_date, config.devteam_members
+                start_date, end_date, config.devteam_members, project_names
             )
-            reporter.print_team_stats(stats, start_date, end_date)
+            reporter.print_team_stats(stats, start_date, end_date, project_names)
 
-        if args.type == "projects" or args.type == "all":
+        # Skip "by project" report if filtering by specific project(s) - it's redundant
+        if args.type == "projects" or (args.type == "all" and not project_names):
             stats = reporter.get_avg_duration_by_project(
                 start_date, end_date, config.devteam_members if args.team else None
             )
@@ -162,9 +167,15 @@ def handle_stats(args):
 
         if args.type == "duration" or args.type == "all":
             stats = reporter.get_avg_duration_by_member(
-                start_date, end_date, config.devteam_members
+                start_date, end_date, config.devteam_members, project_names
             )
-            reporter.print_duration_by_member(stats, start_date, end_date)
+            reporter.print_duration_by_member(stats, start_date, end_date, project_names)
+
+        if args.type == "utilization" or args.type == "all":
+            stats = reporter.get_utilization_rate(
+                start_date, end_date, config.devteam_members, project_names
+            )
+            reporter.print_utilization_rate(stats, start_date, end_date, project_names)
 
     finally:
         session.close()
@@ -284,14 +295,19 @@ def main():
     )
     stats_parser.add_argument(
         "--type",
-        choices=["all", "team", "projects", "duration"],
+        choices=["all", "team", "projects", "duration", "utilization"],
         default="all",
-        help="Type of stats: all, team (member stats), projects (avg duration by project), duration (avg duration by member)",
+        help="Type of stats: all, team, projects, duration, utilization (workload distribution)",
     )
     stats_parser.add_argument(
         "--team",
         action="store_true",
         help="Filter project stats by team members only",
+    )
+    stats_parser.add_argument(
+        "--projects",
+        type=str,
+        help="Comma-separated list of project names to filter by",
     )
 
     # Status command
