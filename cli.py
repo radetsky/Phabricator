@@ -152,30 +152,90 @@ def handle_stats(args):
 
         reporter = StatsReporter(session)
 
-        if args.type == "team" or args.type == "all":
-            stats = reporter.get_team_member_stats(
-                start_date, end_date, config.devteam_members, project_names
-            )
-            reporter.print_team_stats(stats, start_date, end_date, project_names)
+        # Determine period type
+        period_type = None
+        if args.monthly:
+            period_type = "monthly"
+        elif args.weekly:
+            period_type = "weekly"
 
-        # Skip "by project" report if filtering by specific project(s) - it's redundant
-        if args.type == "projects" or (args.type == "all" and not project_names):
-            stats = reporter.get_avg_duration_by_project(
-                start_date, end_date, config.devteam_members if args.team else None
-            )
-            reporter.print_duration_by_project(stats, start_date, end_date)
+        # Periodic stats (--monthly or --weekly)
+        if period_type:
+            if args.type == "team" or args.type == "all":
+                stats = reporter.get_team_member_stats_periodic(
+                    start_date, end_date, config.devteam_members, project_names, period_type
+                )
+                reporter.print_team_stats_periodic(
+                    stats, "resolved", start_date, end_date, project_names, period_type
+                )
+                if args.csv:
+                    reporter.export_team_stats_periodic_csv(stats, args.csv, "resolved")
 
-        if args.type == "duration" or args.type == "all":
-            stats = reporter.get_avg_duration_by_member(
-                start_date, end_date, config.devteam_members, project_names
-            )
-            reporter.print_duration_by_member(stats, start_date, end_date, project_names)
+            # Skip "by project" report if filtering by specific project(s)
+            if args.type == "projects" or (args.type == "all" and not project_names):
+                stats = reporter.get_avg_duration_by_project_periodic(
+                    start_date, end_date,
+                    config.devteam_members if args.team else None,
+                    period_type
+                )
+                reporter.print_duration_by_project_periodic(
+                    stats, start_date, end_date, period_type
+                )
+                if args.csv and args.type == "projects":
+                    reporter.export_pivot_csv(
+                        stats, args.csv, row_label="project", total_key="avg"
+                    )
 
-        if args.type == "utilization" or args.type == "all":
-            stats = reporter.get_utilization_rate(
-                start_date, end_date, config.devteam_members, project_names
-            )
-            reporter.print_utilization_rate(stats, start_date, end_date, project_names)
+            if args.type == "duration" or args.type == "all":
+                stats = reporter.get_avg_duration_by_member_periodic(
+                    start_date, end_date, config.devteam_members, project_names, period_type
+                )
+                reporter.print_duration_by_member_periodic(
+                    stats, start_date, end_date, project_names, period_type
+                )
+                if args.csv and args.type == "duration":
+                    reporter.export_pivot_csv(
+                        stats, args.csv, row_label="member", total_key="avg"
+                    )
+
+            if args.type == "utilization" or args.type == "all":
+                stats = reporter.get_utilization_rate_periodic(
+                    start_date, end_date, config.devteam_members, project_names, period_type
+                )
+                reporter.print_utilization_rate_periodic(
+                    stats, start_date, end_date, project_names, period_type
+                )
+                if args.csv and args.type == "utilization":
+                    reporter.export_pivot_csv(
+                        stats, args.csv, row_label="member", total_key="avg"
+                    )
+
+        # Non-periodic stats (original behavior)
+        else:
+            if args.type == "team" or args.type == "all":
+                stats = reporter.get_team_member_stats(
+                    start_date, end_date, config.devteam_members, project_names
+                )
+                reporter.print_team_stats(stats, start_date, end_date, project_names)
+
+            # Skip "by project" report if filtering by specific project(s) - it's redundant
+            if args.type == "projects" or (args.type == "all" and not project_names):
+                stats = reporter.get_avg_duration_by_project(
+                    start_date, end_date, config.devteam_members if args.team else None
+                )
+                reporter.print_duration_by_project(stats, start_date, end_date)
+
+            if args.type == "duration" or args.type == "all":
+                stats = reporter.get_avg_duration_by_member(
+                    start_date, end_date, config.devteam_members, project_names
+                )
+                reporter.print_duration_by_member(stats, start_date, end_date, project_names)
+
+            if args.type == "utilization" or args.type == "all":
+                stats = reporter.get_utilization_rate(
+                    start_date, end_date, config.devteam_members, project_names
+                )
+                reporter.print_utilization_rate(stats, start_date, end_date, project_names)
 
     finally:
         session.close()
@@ -309,6 +369,21 @@ def main():
         type=str,
         help="Comma-separated list of project names to filter by",
     )
+
+    # Mutually exclusive period flags
+    period_group = stats_parser.add_mutually_exclusive_group()
+    period_group.add_argument(
+        "--monthly",
+        action="store_true",
+        help="Break down stats by calendar month",
+    )
+    period_group.add_argument(
+        "--weekly",
+        action="store_true",
+        help="Break down stats by ISO week (Mon-Sun)",
+    )
+
+    stats_parser.add_argument("--csv", type=str, help="Export to CSV file")
 
     # Status command
     subparsers.add_parser("status", help="Show sync status and configuration")
