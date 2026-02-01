@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import sys
 from datetime import datetime
 
@@ -7,6 +8,12 @@ from phabricator.client import PhabricatorClient, PhabricatorConfiguration
 from phabricator.database import init_db, get_session, get_db_path
 from phabricator.sync import PhabricatorSyncer
 from phabricator.reports import TaskReporter, LifecycleReporter, StatsReporter
+
+
+def get_sheets_exporter():
+    """Get Google Sheets exporter if credentials are available."""
+    from phabricator.export import GoogleSheetsExporter
+    return GoogleSheetsExporter()
 
 
 def parse_date(date_str: str) -> datetime:
@@ -81,6 +88,12 @@ def handle_report(args):
         if args.csv:
             reporter.export_csv(tasks, args.csv)
 
+        if args.sheets or args.sheets_id:
+            exporter = get_sheets_exporter()
+            formatted_tasks = [reporter.format_task(task) for task in tasks]
+            title = args.sheets or f"Task Report {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+            exporter.export_task_report(formatted_tasks, title, args.sheets_id)
+
     finally:
         session.close()
 
@@ -101,6 +114,11 @@ def handle_lifecycle(args):
 
             details = reporter.calculate_duration(task)
             reporter.print_task_details(details)
+
+            if args.sheets or args.sheets_id:
+                exporter = get_sheets_exporter()
+                title = args.sheets or f"Lifecycle {args.task}"
+                exporter.export_lifecycle_report([details], title, args.sheets_id)
             return
 
         start_date = parse_date(args.start_date)
@@ -122,6 +140,12 @@ def handle_lifecycle(args):
 
         if args.csv:
             reporter.export_csv(tasks, args.csv)
+
+        if args.sheets or args.sheets_id:
+            exporter = get_sheets_exporter()
+            durations = [reporter.calculate_duration(task) for task in tasks]
+            title = args.sheets or f"Lifecycle {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+            exporter.export_lifecycle_report(durations, title, args.sheets_id)
 
     finally:
         session.close()
@@ -152,30 +176,107 @@ def handle_stats(args):
 
         reporter = StatsReporter(session)
 
-        if args.type == "team" or args.type == "all":
-            stats = reporter.get_team_member_stats(
-                start_date, end_date, config.devteam_members, project_names
-            )
-            reporter.print_team_stats(stats, start_date, end_date, project_names)
+        # Determine period type
+        period_type = None
+        if args.monthly:
+            period_type = "monthly"
+        elif args.weekly:
+            period_type = "weekly"
 
-        # Skip "by project" report if filtering by specific project(s) - it's redundant
-        if args.type == "projects" or (args.type == "all" and not project_names):
-            stats = reporter.get_avg_duration_by_project(
-                start_date, end_date, config.devteam_members if args.team else None
-            )
-            reporter.print_duration_by_project(stats, start_date, end_date)
+        # Collect stats data for potential Sheets export
+        sheets_data = {}
 
-        if args.type == "duration" or args.type == "all":
-            stats = reporter.get_avg_duration_by_member(
-                start_date, end_date, config.devteam_members, project_names
-            )
-            reporter.print_duration_by_member(stats, start_date, end_date, project_names)
+        # Periodic stats (--monthly or --weekly)
+        if period_type:
+            if args.type == "team" or args.type == "all":
+                stats = reporter.get_team_member_stats_periodic(
+                    start_date, end_date, config.devteam_members, project_names, period_type
+                )
+                reporter.print_team_stats_periodic(
+                    stats, "resolved", start_date, end_date, project_names, period_type
+                )
+                if args.csv:
+                    reporter.export_team_stats_periodic_csv(stats, args.csv, "resolved")
+                sheets_data["team_stats_periodic"] = stats
 
-        if args.type == "utilization" or args.type == "all":
-            stats = reporter.get_utilization_rate(
-                start_date, end_date, config.devteam_members, project_names
-            )
-            reporter.print_utilization_rate(stats, start_date, end_date, project_names)
+            # Skip "by project" report if filtering by specific project(s)
+            if args.type == "projects" or (args.type == "all" and not project_names):
+                stats = reporter.get_avg_duration_by_project_periodic(
+                    start_date, end_date,
+                    config.devteam_members if args.team else None,
+                    period_type
+                )
+                reporter.print_duration_by_project_periodic(
+                    stats, start_date, end_date, period_type
+                )
+                if args.csv and args.type == "projects":
+                    reporter.export_pivot_csv(
+                        stats, args.csv, row_label="project", total_key="avg"
+                    )
+                sheets_data["duration_by_project_periodic"] = stats
+
+            if args.type == "duration" or args.type == "all":
+                stats = reporter.get_avg_duration_by_member_periodic(
+                    start_date, end_date, config.devteam_members, project_names, period_type
+                )
+                reporter.print_duration_by_member_periodic(
+                    stats, start_date, end_date, project_names, period_type
+                )
+                if args.csv and args.type == "duration":
+                    reporter.export_pivot_csv(
+                        stats, args.csv, row_label="member", total_key="avg"
+                    )
+                sheets_data["duration_by_member_periodic"] = stats
+
+            if args.type == "utilization" or args.type == "all":
+                stats = reporter.get_utilization_rate_periodic(
+                    start_date, end_date, config.devteam_members, project_names, period_type
+                )
+                reporter.print_utilization_rate_periodic(
+                    stats, start_date, end_date, project_names, period_type
+                )
+                if args.csv and args.type == "utilization":
+                    reporter.export_pivot_csv(
+                        stats, args.csv, row_label="member", total_key="avg"
+                    )
+                sheets_data["utilization_periodic"] = stats
+
+        # Non-periodic stats (original behavior)
+        else:
+            if args.type == "team" or args.type == "all":
+                stats = reporter.get_team_member_stats(
+                    start_date, end_date, config.devteam_members, project_names
+                )
+                reporter.print_team_stats(stats, start_date, end_date, project_names)
+                sheets_data["team_stats"] = stats
+
+            # Skip "by project" report if filtering by specific project(s) - it's redundant
+            if args.type == "projects" or (args.type == "all" and not project_names):
+                stats = reporter.get_avg_duration_by_project(
+                    start_date, end_date, config.devteam_members if args.team else None
+                )
+                reporter.print_duration_by_project(stats, start_date, end_date)
+                sheets_data["duration_by_project"] = stats
+
+            if args.type == "duration" or args.type == "all":
+                stats = reporter.get_avg_duration_by_member(
+                    start_date, end_date, config.devteam_members, project_names
+                )
+                reporter.print_duration_by_member(stats, start_date, end_date, project_names)
+                sheets_data["duration_by_member"] = stats
+
+            if args.type == "utilization" or args.type == "all":
+                stats = reporter.get_utilization_rate(
+                    start_date, end_date, config.devteam_members, project_names
+                )
+                reporter.print_utilization_rate(stats, start_date, end_date, project_names)
+                sheets_data["utilization"] = stats
+
+        # Export to Google Sheets if requested
+        if args.sheets or args.sheets_id:
+            exporter = get_sheets_exporter()
+            title = args.sheets or f"Stats {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+            exporter.export_stats_report(sheets_data, title, args.sheets_id)
 
     finally:
         session.close()
@@ -212,6 +313,17 @@ def handle_status(args):
                 print(
                     f"  {entity_type}: {info['records_synced']} records, last sync: {last_sync_str}"
                 )
+
+        # Google Sheets configuration status
+        print("\nGoogle Sheets:")
+        google_creds = os.environ.get("GOOGLE_CREDENTIALS_FILE")
+        if google_creds:
+            if os.path.exists(google_creds):
+                print(f"  Credentials: {google_creds} (found)")
+            else:
+                print(f"  Credentials: {google_creds} (NOT FOUND)")
+        else:
+            print("  Credentials: Not configured (set GOOGLE_CREDENTIALS_FILE)")
 
     finally:
         session.close()
@@ -264,6 +376,14 @@ def main():
         help="Filter by team members from DEVTEAM_MEMBERS env var",
     )
     report_parser.add_argument("--csv", type=str, help="Export to CSV file")
+    report_parser.add_argument(
+        "--sheets", type=str, metavar="TITLE",
+        help="Export to new Google Sheets spreadsheet with this title"
+    )
+    report_parser.add_argument(
+        "--sheets-id", type=str, metavar="ID",
+        help="Export to existing Google Sheets spreadsheet by ID"
+    )
 
     # Lifecycle command
     lifecycle_parser = subparsers.add_parser(
@@ -284,6 +404,14 @@ def main():
         help="Filter by team members from DEVTEAM_MEMBERS env var",
     )
     lifecycle_parser.add_argument("--csv", type=str, help="Export to CSV file")
+    lifecycle_parser.add_argument(
+        "--sheets", type=str, metavar="TITLE",
+        help="Export to new Google Sheets spreadsheet with this title"
+    )
+    lifecycle_parser.add_argument(
+        "--sheets-id", type=str, metavar="ID",
+        help="Export to existing Google Sheets spreadsheet by ID"
+    )
 
     # Stats command
     stats_parser = subparsers.add_parser("stats", help="Team and project statistics")
@@ -308,6 +436,29 @@ def main():
         "--projects",
         type=str,
         help="Comma-separated list of project names to filter by",
+    )
+
+    # Mutually exclusive period flags
+    period_group = stats_parser.add_mutually_exclusive_group()
+    period_group.add_argument(
+        "--monthly",
+        action="store_true",
+        help="Break down stats by calendar month",
+    )
+    period_group.add_argument(
+        "--weekly",
+        action="store_true",
+        help="Break down stats by ISO week (Mon-Sun)",
+    )
+
+    stats_parser.add_argument("--csv", type=str, help="Export to CSV file")
+    stats_parser.add_argument(
+        "--sheets", type=str, metavar="TITLE",
+        help="Export to new Google Sheets spreadsheet with this title"
+    )
+    stats_parser.add_argument(
+        "--sheets-id", type=str, metavar="ID",
+        help="Export to existing Google Sheets spreadsheet by ID"
     )
 
     # Status command

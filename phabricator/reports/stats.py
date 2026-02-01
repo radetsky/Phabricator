@@ -1,3 +1,4 @@
+import csv
 from datetime import datetime, timedelta
 from typing import Optional
 from collections import defaultdict
@@ -6,6 +7,7 @@ from sqlalchemy import select, func, and_
 from sqlalchemy.orm import Session
 
 from ..database.models import Task, User, Project, task_projects
+from .periods import generate_periods, PeriodType
 
 
 class StatsReporter:
@@ -471,3 +473,600 @@ class StatsReporter:
                 f"{s['min_duration_hours']:<10} "
                 f"{s['max_duration_hours']:<10}"
             )
+
+    # =====================================================================
+    # Periodic Methods - Break down stats by calendar periods
+    # =====================================================================
+
+    def get_team_member_stats_periodic(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        member_usernames: list[str],
+        project_names: Optional[list[str]],
+        period_type: PeriodType,
+    ) -> dict:
+        """
+        Get team member stats broken down by period.
+        Returns pivot structure with periods as columns, members as rows.
+        """
+        periods = generate_periods(start_date, end_date, period_type)
+        period_labels = [p.label for p in periods]
+
+        member_phids = dict(
+            self.session.execute(
+                select(User.username, User.phid).where(
+                    User.username.in_(member_usernames)
+                )
+            ).all()
+        )
+
+        project_phids = None
+        if project_names:
+            project_phids = self._get_project_phids(project_names)
+
+        def apply_project_filter(stmt):
+            if project_phids:
+                return self._filter_by_projects(stmt, project_phids)
+            return stmt
+
+        rows = []
+        for username, phid in sorted(member_phids.items()):
+            resolved_values = []
+            authored_values = []
+            owned_values = []
+            open_values = []
+
+            for period in periods:
+                # Resolved in period
+                stmt = select(func.count(Task.id)).where(
+                    and_(
+                        Task.owner_phid == phid,
+                        Task.status_value == "resolved",
+                        Task.date_closed >= period.start,
+                        Task.date_closed <= period.end,
+                    )
+                )
+                resolved = self.session.scalar(apply_project_filter(stmt)) or 0
+                resolved_values.append(resolved)
+
+                # Authored in period
+                stmt = select(func.count(Task.id)).where(
+                    and_(
+                        Task.author_phid == phid,
+                        Task.date_created >= period.start,
+                        Task.date_created <= period.end,
+                    )
+                )
+                authored = self.session.scalar(apply_project_filter(stmt)) or 0
+                authored_values.append(authored)
+
+                # Owned in period (by modified date)
+                stmt = select(func.count(Task.id)).where(
+                    and_(
+                        Task.owner_phid == phid,
+                        Task.date_modified >= period.start,
+                        Task.date_modified <= period.end,
+                    )
+                )
+                owned = self.session.scalar(apply_project_filter(stmt)) or 0
+                owned_values.append(owned)
+
+                # Open tasks at end of period (simplified: current open)
+                stmt = select(func.count(Task.id)).where(
+                    and_(
+                        Task.owner_phid == phid,
+                        Task.status_value == "open",
+                    )
+                )
+                open_count = self.session.scalar(apply_project_filter(stmt)) or 0
+                open_values.append(open_count)
+
+            rows.append({
+                "member": username,
+                "resolved": resolved_values,
+                "authored": authored_values,
+                "owned": owned_values,
+                "open": open_values,
+            })
+
+        # Calculate column totals
+        totals = {
+            "resolved": [sum(r["resolved"][i] for r in rows) for i in range(len(periods))],
+            "authored": [sum(r["authored"][i] for r in rows) for i in range(len(periods))],
+            "owned": [sum(r["owned"][i] for r in rows) for i in range(len(periods))],
+            "open": [sum(r["open"][i] for r in rows) for i in range(len(periods))],
+        }
+
+        return {
+            "periods": period_labels,
+            "rows": rows,
+            "totals": totals,
+        }
+
+    def get_avg_duration_by_member_periodic(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        member_usernames: list[str],
+        project_names: Optional[list[str]],
+        period_type: PeriodType,
+    ) -> dict:
+        """
+        Get average task duration by member, broken down by period.
+        Members as rows, periods as columns, avg_duration_days as values.
+        """
+        periods = generate_periods(start_date, end_date, period_type)
+        period_labels = [p.label for p in periods]
+
+        member_phids = dict(
+            self.session.execute(
+                select(User.username, User.phid).where(
+                    User.username.in_(member_usernames)
+                )
+            ).all()
+        )
+
+        project_phids = None
+        if project_names:
+            project_phids = self._get_project_phids(project_names)
+
+        rows = []
+        for username, phid in sorted(member_phids.items()):
+            values = []
+            for period in periods:
+                stmt = select(Task).where(
+                    and_(
+                        Task.owner_phid == phid,
+                        Task.status_value == "resolved",
+                        Task.date_closed >= period.start,
+                        Task.date_closed <= period.end,
+                        Task.date_closed.isnot(None),
+                    )
+                )
+                if project_phids:
+                    stmt = self._filter_by_projects(stmt, project_phids)
+
+                tasks = self.session.execute(stmt).scalars().all()
+
+                durations = []
+                for task in tasks:
+                    if task.date_closed and task.date_created:
+                        duration = task.date_closed - task.date_created
+                        durations.append(duration.total_seconds() / 3600)
+
+                if durations:
+                    avg_days = round((sum(durations) / len(durations)) / 24, 1)
+                else:
+                    avg_days = 0.0
+
+                values.append(avg_days)
+
+            # Calculate row average (excluding zeros)
+            non_zero = [v for v in values if v > 0]
+            avg = round(sum(non_zero) / len(non_zero), 1) if non_zero else 0.0
+
+            rows.append({
+                "member": username,
+                "values": values,
+                "avg": avg,
+            })
+
+        return {
+            "periods": period_labels,
+            "rows": rows,
+        }
+
+    def get_avg_duration_by_project_periodic(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        member_usernames: Optional[list[str]],
+        period_type: PeriodType,
+    ) -> dict:
+        """
+        Get average task duration by project, broken down by period.
+        Projects as rows, periods as columns.
+        """
+        periods = generate_periods(start_date, end_date, period_type)
+        period_labels = [p.label for p in periods]
+
+        member_phids = None
+        if member_usernames:
+            member_phids = set(
+                self.session.execute(
+                    select(User.phid).where(User.username.in_(member_usernames))
+                )
+                .scalars()
+                .all()
+            )
+
+        # Collect project->period->durations data
+        project_period_durations = defaultdict(lambda: defaultdict(list))
+
+        for idx, period in enumerate(periods):
+            stmt = select(Task).where(
+                and_(
+                    Task.status_value == "resolved",
+                    Task.date_closed >= period.start,
+                    Task.date_closed <= period.end,
+                    Task.date_closed.isnot(None),
+                )
+            )
+            if member_phids:
+                stmt = stmt.where(Task.owner_phid.in_(member_phids))
+
+            tasks = self.session.execute(stmt).scalars().all()
+
+            for task in tasks:
+                if task.date_closed and task.date_created:
+                    duration_hours = (task.date_closed - task.date_created).total_seconds() / 3600
+                    if task.projects:
+                        for project in task.projects:
+                            project_period_durations[project.name][idx].append(duration_hours)
+                    else:
+                        project_period_durations["(No Project)"][idx].append(duration_hours)
+
+        rows = []
+        for project_name in sorted(project_period_durations.keys()):
+            values = []
+            for idx in range(len(periods)):
+                durations = project_period_durations[project_name][idx]
+                if durations:
+                    avg_days = round((sum(durations) / len(durations)) / 24, 1)
+                else:
+                    avg_days = 0.0
+                values.append(avg_days)
+
+            non_zero = [v for v in values if v > 0]
+            avg = round(sum(non_zero) / len(non_zero), 1) if non_zero else 0.0
+
+            rows.append({
+                "project": project_name,
+                "values": values,
+                "avg": avg,
+            })
+
+        return {
+            "periods": period_labels,
+            "rows": rows,
+        }
+
+    def get_utilization_rate_periodic(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        member_usernames: list[str],
+        project_names: Optional[list[str]],
+        period_type: PeriodType,
+    ) -> dict:
+        """
+        Get utilization rate (task %) by member, broken down by period.
+        Members as rows, periods as columns, task_percent as values.
+        """
+        periods = generate_periods(start_date, end_date, period_type)
+        period_labels = [p.label for p in periods]
+
+        member_phids = dict(
+            self.session.execute(
+                select(User.username, User.phid).where(
+                    User.username.in_(member_usernames)
+                )
+            ).all()
+        )
+
+        project_phids = None
+        if project_names:
+            project_phids = self._get_project_phids(project_names)
+
+        # First pass: collect task counts per member per period
+        member_counts = {username: [] for username in member_phids.keys()}
+        period_totals = []
+
+        for period in periods:
+            period_total = 0
+            for username, phid in sorted(member_phids.items()):
+                stmt = select(func.count(Task.id)).where(
+                    and_(
+                        Task.owner_phid == phid,
+                        Task.status_value == "resolved",
+                        Task.date_closed >= period.start,
+                        Task.date_closed <= period.end,
+                    )
+                )
+                if project_phids:
+                    stmt = self._filter_by_projects(stmt, project_phids)
+
+                count = self.session.scalar(stmt) or 0
+                member_counts[username].append(count)
+                period_total += count
+
+            period_totals.append(period_total)
+
+        # Second pass: calculate percentages
+        rows = []
+        for username in sorted(member_phids.keys()):
+            counts = member_counts[username]
+            values = []
+            for i, count in enumerate(counts):
+                if period_totals[i] > 0:
+                    pct = round(count / period_totals[i] * 100, 1)
+                else:
+                    pct = 0.0
+                values.append(pct)
+
+            # Average of percentages (excluding zeros)
+            non_zero = [v for v in values if v > 0]
+            avg = round(sum(non_zero) / len(non_zero), 1) if non_zero else 0.0
+
+            rows.append({
+                "member": username,
+                "values": values,
+                "avg": avg,
+            })
+
+        return {
+            "periods": period_labels,
+            "rows": rows,
+            "period_totals": period_totals,
+        }
+
+    # =====================================================================
+    # Periodic Print Methods - Pivot table output
+    # =====================================================================
+
+    def _print_pivot_header(
+        self,
+        title: str,
+        start_date: datetime,
+        end_date: datetime,
+        period_type: PeriodType,
+        project_names: Optional[list[str]] = None,
+    ):
+        period_label = "MONTHLY" if period_type == "monthly" else "WEEKLY"
+        print(f"\n{'='*80}")
+        print(f"{title} ({period_label})")
+        print(f"Period: {start_date.strftime('%Y-%m-%d')} - {end_date.strftime('%Y-%m-%d')}")
+        if project_names:
+            print(f"Projects: {', '.join(project_names)}")
+        print(f"{'='*80}\n")
+
+    def _calculate_col_width(self, periods: list[str]) -> int:
+        """Calculate column width based on period labels."""
+        max_label_len = max(len(p) for p in periods) if periods else 7
+        return max(max_label_len + 2, 10)
+
+    def print_team_stats_periodic(
+        self,
+        data: dict,
+        metric: str,
+        start_date: datetime,
+        end_date: datetime,
+        project_names: Optional[list[str]],
+        period_type: PeriodType,
+    ):
+        """Print team stats pivot table for a specific metric."""
+        metric_titles = {
+            "resolved": "TEAM MEMBER STATISTICS - RESOLVED TASKS",
+            "authored": "TEAM MEMBER STATISTICS - AUTHORED TASKS",
+            "owned": "TEAM MEMBER STATISTICS - OWNED TASKS",
+            "open": "TEAM MEMBER STATISTICS - OPEN TASKS",
+        }
+        self._print_pivot_header(
+            metric_titles.get(metric, f"TEAM STATS - {metric.upper()}"),
+            start_date, end_date, period_type, project_names
+        )
+
+        periods = data["periods"]
+        rows = data["rows"]
+        totals = data["totals"][metric]
+
+        col_width = self._calculate_col_width(periods)
+        member_width = 15
+
+        # Header row
+        header = f"{'Member':<{member_width}}"
+        for p in periods:
+            header += f"{p:>{col_width}}"
+        header += f"{'TOTAL':>{col_width}}"
+        print(header)
+        print("-" * len(header))
+
+        # Data rows
+        for row in rows:
+            values = row[metric]
+            total = sum(values)
+            line = f"{row['member']:<{member_width}}"
+            for v in values:
+                line += f"{v:>{col_width}}"
+            line += f"{total:>{col_width}}"
+            print(line)
+
+        # Total row
+        print("-" * len(header))
+        total_line = f"{'TOTAL':<{member_width}}"
+        for t in totals:
+            total_line += f"{t:>{col_width}}"
+        total_line += f"{sum(totals):>{col_width}}"
+        print(total_line)
+
+    def print_duration_by_member_periodic(
+        self,
+        data: dict,
+        start_date: datetime,
+        end_date: datetime,
+        project_names: Optional[list[str]],
+        period_type: PeriodType,
+    ):
+        """Print average duration by member pivot table."""
+        self._print_pivot_header(
+            "AVG TASK DURATION IN DAYS",
+            start_date, end_date, period_type, project_names
+        )
+
+        periods = data["periods"]
+        rows = data["rows"]
+
+        col_width = self._calculate_col_width(periods)
+        member_width = 15
+
+        # Header row
+        header = f"{'Member':<{member_width}}"
+        for p in periods:
+            header += f"{p:>{col_width}}"
+        header += f"{'AVG':>{col_width}}"
+        print(header)
+        print("-" * len(header))
+
+        # Data rows
+        for row in rows:
+            line = f"{row['member']:<{member_width}}"
+            for v in row["values"]:
+                line += f"{v:>{col_width}.1f}" if v > 0 else f"{'-':>{col_width}}"
+            line += f"{row['avg']:>{col_width}.1f}" if row["avg"] > 0 else f"{'-':>{col_width}}"
+            print(line)
+
+    def print_duration_by_project_periodic(
+        self,
+        data: dict,
+        start_date: datetime,
+        end_date: datetime,
+        period_type: PeriodType,
+    ):
+        """Print average duration by project pivot table."""
+        self._print_pivot_header(
+            "AVG TASK DURATION BY PROJECT IN DAYS",
+            start_date, end_date, period_type
+        )
+
+        periods = data["periods"]
+        rows = data["rows"]
+
+        col_width = self._calculate_col_width(periods)
+        project_width = 25
+
+        # Header row
+        header = f"{'Project':<{project_width}}"
+        for p in periods:
+            header += f"{p:>{col_width}}"
+        header += f"{'AVG':>{col_width}}"
+        print(header)
+        print("-" * len(header))
+
+        # Data rows
+        for row in rows:
+            project_name = row["project"][:project_width-1]
+            line = f"{project_name:<{project_width}}"
+            for v in row["values"]:
+                line += f"{v:>{col_width}.1f}" if v > 0 else f"{'-':>{col_width}}"
+            line += f"{row['avg']:>{col_width}.1f}" if row["avg"] > 0 else f"{'-':>{col_width}}"
+            print(line)
+
+    def print_utilization_rate_periodic(
+        self,
+        data: dict,
+        start_date: datetime,
+        end_date: datetime,
+        project_names: Optional[list[str]],
+        period_type: PeriodType,
+    ):
+        """Print utilization rate pivot table."""
+        self._print_pivot_header(
+            "UTILIZATION RATE %",
+            start_date, end_date, period_type, project_names
+        )
+
+        periods = data["periods"]
+        rows = data["rows"]
+
+        col_width = self._calculate_col_width(periods)
+        member_width = 15
+
+        # Header row
+        header = f"{'Member':<{member_width}}"
+        for p in periods:
+            header += f"{p:>{col_width}}"
+        header += f"{'AVG':>{col_width}}"
+        print(header)
+        print("-" * len(header))
+
+        # Data rows
+        for row in rows:
+            line = f"{row['member']:<{member_width}}"
+            for v in row["values"]:
+                line += f"{v:>{col_width}.1f}" if v > 0 else f"{'-':>{col_width}}"
+            line += f"{row['avg']:>{col_width}.1f}" if row["avg"] > 0 else f"{'-':>{col_width}}"
+            print(line)
+
+    # =====================================================================
+    # CSV Export for Periodic Data
+    # =====================================================================
+
+    def export_pivot_csv(
+        self,
+        data: dict,
+        filepath: str,
+        row_label: str = "member",
+        value_key: str = "values",
+        total_key: str = "total",
+    ):
+        """
+        Export pivot data to CSV with periods as columns.
+        Headers: row_label,period1,period2,...,total/avg
+        """
+        periods = data["periods"]
+        rows = data["rows"]
+
+        with open(filepath, "w", newline="") as f:
+            writer = csv.writer(f)
+
+            # Header
+            header = [row_label] + periods + [total_key]
+            writer.writerow(header)
+
+            # Data rows
+            for row in rows:
+                label = row.get(row_label, row.get("project", ""))
+                values = row.get(value_key, [])
+
+                # Calculate total or use avg
+                if "avg" in row:
+                    total = row["avg"]
+                else:
+                    total = sum(values)
+
+                csv_row = [label] + values + [total]
+                writer.writerow(csv_row)
+
+        print(f"\nExported to: {filepath}")
+
+    def export_team_stats_periodic_csv(
+        self,
+        data: dict,
+        filepath: str,
+        metric: str,
+    ):
+        """Export team stats pivot data for a specific metric."""
+        periods = data["periods"]
+        rows = data["rows"]
+
+        with open(filepath, "w", newline="") as f:
+            writer = csv.writer(f)
+
+            # Header
+            header = ["member"] + periods + ["total"]
+            writer.writerow(header)
+
+            # Data rows
+            for row in rows:
+                values = row[metric]
+                total = sum(values)
+                csv_row = [row["member"]] + values + [total]
+                writer.writerow(csv_row)
+
+            # Total row
+            totals = data["totals"][metric]
+            total_row = ["TOTAL"] + totals + [sum(totals)]
+            writer.writerow(total_row)
+
+        print(f"\nExported to: {filepath}")
