@@ -12,7 +12,7 @@ class GoogleSheetsExporter:
 
     SCOPES = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive",
     ]
 
     def __init__(self, credentials_file: Optional[str] = None):
@@ -39,6 +39,42 @@ class GoogleSheetsExporter:
         )
         self.sheets_service = build("sheets", "v4", credentials=self.credentials)
         self.drive_service = build("drive", "v3", credentials=self.credentials)
+
+    def find_spreadsheet_by_name(self, name: str) -> Optional[str]:
+        """Find a spreadsheet by name.
+
+        Args:
+            name: The name of the spreadsheet to find.
+
+        Returns:
+            The spreadsheet ID if found, None otherwise.
+        """
+        query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.spreadsheet'"
+        results = (
+            self.drive_service.files()
+            .list(q=query, fields="files(id, name)", pageSize=1)
+            .execute()
+        )
+        files = results.get("files", [])
+        if files:
+            return files[0]["id"]
+        return None
+
+    def get_or_create_spreadsheet(self, title: str) -> str:
+        """Get existing spreadsheet by name or create a new one.
+
+        Args:
+            title: The spreadsheet title to find or create.
+
+        Returns:
+            The spreadsheet ID.
+        """
+        spreadsheet_id = self.find_spreadsheet_by_name(title)
+        if spreadsheet_id:
+            print(f"Found existing spreadsheet: {title}")
+            return spreadsheet_id
+        print(f"Creating new spreadsheet: {title}")
+        return self.create_spreadsheet(title)
 
     def create_spreadsheet(self, title: str) -> str:
         """Create a new spreadsheet.
@@ -317,7 +353,7 @@ class GoogleSheetsExporter:
             The spreadsheet ID.
         """
         if not spreadsheet_id:
-            spreadsheet_id = self.create_spreadsheet(title)
+            spreadsheet_id = self.get_or_create_spreadsheet(title)
 
         headers = [
             "ID",
@@ -374,7 +410,7 @@ class GoogleSheetsExporter:
             The spreadsheet ID.
         """
         if not spreadsheet_id:
-            spreadsheet_id = self.create_spreadsheet(title)
+            spreadsheet_id = self.get_or_create_spreadsheet(title)
 
         headers = [
             "ID",
@@ -455,7 +491,7 @@ class GoogleSheetsExporter:
             The spreadsheet ID.
         """
         if not spreadsheet_id:
-            spreadsheet_id = self.create_spreadsheet(title)
+            spreadsheet_id = self.get_or_create_spreadsheet(title)
 
         chart_anchor_row = 2
 

@@ -279,17 +279,30 @@ Export reports directly to Google Sheets with auto-generated charts. Requires a 
    # Should show: Credentials: /path/to/key.json (found)
    ```
 
+### Share Spreadsheets with Service Account
+
+To write to an existing spreadsheet, share it with the service account email (found in the JSON key file as `client_email`):
+
+1. Open the spreadsheet in Google Sheets
+2. Click "Share"
+3. Add the service account email (e.g., `my-service@project-id.iam.gserviceaccount.com`)
+4. Grant "Editor" access
+
 ### Usage
 
 All report commands support `--sheets` and `--sheets-id` options:
 
 ```bash
-# Create new spreadsheet
+# Find existing spreadsheet by name, or create new one
 python cli.py stats --start-date 2024-01-01 --end-date 2024-12-31 --sheets "My Report"
 
-# Export to existing spreadsheet (add new sheet tabs)
+# Export to existing spreadsheet by ID (add new sheet tabs)
 python cli.py stats --start-date 2024-01-01 --end-date 2024-12-31 --sheets-id "1aBcDeFg..."
 ```
+
+When using `--sheets "Name"`:
+- If a spreadsheet with that name exists and is shared with the service account, it will be used
+- Otherwise, a new spreadsheet will be created (requires storage quota)
 
 ### Charts
 
